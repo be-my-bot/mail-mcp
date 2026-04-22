@@ -595,9 +595,20 @@ pub async fn append(
     mailbox: &str,
     content: &[u8],
 ) -> AppResult<()> {
+    append_with_flags(server, session, mailbox, None, content).await
+}
+
+/// Append raw RFC822 message to mailbox with optional IMAP flags.
+pub async fn append_with_flags(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    mailbox: &str,
+    flags: Option<&str>,
+    content: &[u8],
+) -> AppResult<()> {
     timeout(
         socket_timeout(server),
-        session.append(mailbox, None, None, content),
+        session.append(mailbox, flags, None, content),
     )
     .await
     .map_err(|_| AppError::Timeout("APPEND timed out".to_owned()))

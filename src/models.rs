@@ -552,6 +552,91 @@ pub struct AppendMessageInput {
     pub raw_message: String,
 }
 
+/// Shared editable fields for IMAP draft creation/update.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DraftContentInput {
+    /// Draft recipients (optional, max 50)
+    #[serde(default)]
+    pub to: Vec<String>,
+    /// Draft CC recipients (optional, max 50)
+    #[serde(default)]
+    pub cc: Vec<String>,
+    /// Draft BCC recipients (optional, max 50)
+    #[serde(default)]
+    pub bcc: Vec<String>,
+    /// Draft subject (optional, max 998 characters)
+    pub subject: Option<String>,
+    /// Draft plain text body (optional)
+    pub body_text: Option<String>,
+    /// Draft HTML body (optional)
+    pub body_html: Option<String>,
+    /// Reply-To address (optional)
+    pub reply_to: Option<String>,
+    /// In-Reply-To message ID for threading (optional)
+    pub in_reply_to: Option<String>,
+    /// References header for threading (optional)
+    pub references: Option<String>,
+    /// File attachments (optional)
+    #[serde(default)]
+    pub attachments: Vec<AttachmentInput>,
+}
+
+/// Input: create a draft in the account's Drafts mailbox.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CreateDraftInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Draft fields to persist
+    #[serde(flatten)]
+    pub draft: DraftContentInput,
+}
+
+/// Input: read a stored draft by stable draft identifier.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReadDraftInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Stable draft identifier (same format as `message_id`)
+    pub draft_id: String,
+}
+
+/// Input: replace a stored draft with new content.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct UpdateDraftInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Stable draft identifier (same format as `message_id`)
+    pub draft_id: String,
+    /// Replacement draft fields
+    #[serde(flatten)]
+    pub draft: DraftContentInput,
+}
+
+/// Input: delete a stored draft.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DeleteDraftInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Stable draft identifier (same format as `message_id`)
+    pub draft_id: String,
+    /// Explicit confirmation required (must be `true`)
+    pub confirm: bool,
+}
+
+/// Input: send a stored draft via SMTP and remove it from Drafts.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SendDraftInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Stable draft identifier (same format as `message_id`)
+    pub draft_id: String,
+}
+
 // ─── Attachment model ────────────────────────────────────────────────────────
 
 /// Email attachment — provide either file_path (preferred for large files) or content_base64

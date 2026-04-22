@@ -179,9 +179,9 @@ Microsoft blocks SMTP on personal accounts. Use Graph API instead:
 
 Get your token in 1 minute with device code flow. See [Account Setup Guide](docs/account-setup.md).
 
-## 30 MCP Tools
+## 35 MCP Tools
 
-### Read (8 tools)
+### Read (9 tools)
 
 | Tool | What it does |
 |------|-------------|
@@ -193,8 +193,9 @@ Get your token in 1 minute with device code flow. See [Account Setup Guide](docs
 | `imap_search_messages` | Search with cursor pagination |
 | `imap_get_message` | Parsed message (text, HTML, attachments) |
 | `imap_get_message_raw` | RFC822 source |
+| `imap_get_draft` | Read a stored draft with editable fields |
 
-### Write (11 tools)
+### Write (14 tools)
 
 | Tool | What it does |
 |------|-------------|
@@ -206,15 +207,19 @@ Get your token in 1 minute with device code flow. See [Account Setup Guide](docs
 | `imap_delete_mailbox` | Delete folder |
 | `imap_rename_mailbox` | Rename folder |
 | `imap_append_message` | Append raw message |
+| `imap_create_draft` | Create a draft in Drafts |
+| `imap_update_draft` | Replace an existing draft |
+| `imap_delete_draft` | Delete a draft |
 | `imap_bulk_move` | Move up to 500 at once |
 | `imap_bulk_delete` | Delete up to 500 at once |
 | `imap_bulk_update_flags` | Flag up to 500 at once |
 
-### Send (5 tools)
+### Send (6 tools)
 
 | Tool | What it does |
 |------|-------------|
 | `smtp_send_message` | Send email (text/HTML, CC/BCC) |
+| `smtp_send_draft` | Send a stored draft via SMTP |
 | `smtp_reply_message` | Reply with threading headers |
 | `smtp_forward_message` | Forward with original inline |
 | `smtp_verify_account` | Test SMTP connectivity |

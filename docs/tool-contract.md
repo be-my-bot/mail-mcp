@@ -335,6 +335,103 @@ Output `data`:
 - `steps_attempted`: integer
 - `steps_succeeded`: integer
 
+### Draft Management
+
+#### `imap_create_draft`
+
+Purpose: create a draft in the account's Drafts mailbox.
+
+Write gate: requires `MAIL_IMAP_WRITE_ENABLED=true`.
+
+Input:
+- `account_id` (optional)
+- `to?`, `cc?`, `bcc?`: string[] (0..50 each)
+- `subject?` (max 998 chars)
+- `body_text?`
+- `body_html?`
+- `reply_to?`
+- `in_reply_to?`
+- `references?`
+- `attachments?`
+
+Output `data`:
+- `status`: `"ok"`
+- `account_id`
+- `mailbox`
+- `draft_id`
+- `message_id_header`
+- `size_bytes`
+
+#### `imap_get_draft`
+
+Purpose: read a stored draft and return its editable fields.
+
+Input:
+- `account_id` (optional)
+- `draft_id` (required stable IMAP id pointing to Drafts)
+
+Output `data`:
+- `status`: `"ok"`
+- `account_id`
+- `draft`: `{ draft_id, mailbox, uidvalidity, uid, to, cc, bcc, subject, reply_to, in_reply_to, references, body_text?, body_html?, flags?, attachments, size_bytes }`
+
+#### `imap_update_draft`
+
+Purpose: replace an existing draft with new content.
+
+Write gate: requires `MAIL_IMAP_WRITE_ENABLED=true`.
+
+Input:
+- `account_id` (optional)
+- `draft_id` (required)
+- same editable fields as `imap_create_draft`
+
+Output `data`:
+- `status`: `"ok" | "partial"`
+- `account_id`
+- `mailbox`
+- `replaced_draft_id`
+- `draft_id`
+- `message_id_header`
+- `size_bytes`
+- `delete_issue?`
+
+#### `imap_delete_draft`
+
+Purpose: delete a stored draft.
+
+Write gate: requires `MAIL_IMAP_WRITE_ENABLED=true`.
+
+Input:
+- `account_id` (optional)
+- `draft_id` (required)
+- `confirm` (required literal `true`)
+
+Output `data`:
+- `status`: `"ok"`
+- `account_id`
+- `draft_id`
+- `mailbox`
+
+#### `smtp_send_draft`
+
+Purpose: send a stored draft via SMTP and remove it from Drafts.
+
+Write gate: requires `MAIL_SMTP_WRITE_ENABLED=true`.
+
+Input:
+- `account_id` (optional)
+- `draft_id` (required)
+
+Output `data`:
+- `status`: `"ok" | "partial"`
+- `account_id`
+- `draft_id`
+- `sent_message_id`
+- `recipients_count`
+- `draft_deleted`
+- `delete_issue?`
+
 ## Security and Guardrails
 
 - Never return secrets (`*_PASS`, tokens, cookies, auth headers).

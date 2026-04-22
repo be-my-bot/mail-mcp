@@ -23,13 +23,15 @@ use crate::imap;
 use crate::message_id::MessageId;
 use crate::mime;
 use crate::models::{
-    AccountInfo, AccountOnlyInput, AppendMessageInput, AttachmentInput, BulkDeleteInput,
-    BulkMoveInput, BulkUpdateFlagsInput, CopyMessageInput, CreateMailboxInput, DeleteMailboxInput,
-    DeleteMessageInput, GetAttachmentInput, GetMessageInput, GetMessageRawInput,
-    GraphSendMessageInput, MailboxInfo, MailboxStatusInfo, MailboxStatusInput, MessageDetail,
-    MessageSummary, Meta, MoveMessageInput, RenameMailboxInput, SearchAndDeleteInput,
-    SearchAndMoveInput, SearchMessagesInput, SmtpForwardMessageInput, SmtpReplyMessageInput,
-    SmtpSendMessageInput, SmtpVerifyAccountInput, ToolEnvelope, UpdateMessageFlagsInput,
+    AccountInfo, AccountOnlyInput, AppendMessageInput, AttachmentInfo, AttachmentInput,
+    BulkDeleteInput, BulkMoveInput, BulkUpdateFlagsInput, CopyMessageInput, CreateDraftInput,
+    CreateMailboxInput, DeleteDraftInput, DeleteMailboxInput, DeleteMessageInput,
+    GetAttachmentInput, GetMessageInput, GetMessageRawInput, GraphSendMessageInput, MailboxInfo,
+    MailboxStatusInfo, MailboxStatusInput, MessageDetail, MessageSummary, Meta, MoveMessageInput,
+    ReadDraftInput, RenameMailboxInput, SearchAndDeleteInput, SearchAndMoveInput,
+    SearchMessagesInput, SendDraftInput, SmtpForwardMessageInput, SmtpReplyMessageInput,
+    SmtpSendMessageInput, SmtpVerifyAccountInput, ToolEnvelope, UpdateDraftInput,
+    UpdateMessageFlagsInput
 };
 use crate::pagination::{CursorEntry, CursorStore};
 use crate::smtp;
@@ -63,6 +65,27 @@ pub struct MailImapServer {
     update_notice: Option<String>,
     /// Tool router for dispatching MCP tool calls
     tool_router: ToolRouter<Self>,
+}
+
+struct StoredDraft {
+    mailbox: String,
+    draft_id: String,
+    header_message_id: String,
+    size_bytes: usize,
+}
+
+struct ParsedDraftContents {
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
+    subject: String,
+    body_text: Option<String>,
+    body_html: Option<String>,
+    reply_to: Option<String>,
+    in_reply_to: Option<String>,
+    references: Option<String>,
+    attachments: Vec<smtp::EmailAttachment>,
+    attachment_info: Vec<AttachmentInfo>,
 }
 
 #[tool_router]
@@ -155,6 +178,7 @@ impl MailImapServer {
                 let mut send_methods = Vec::new();
                 if has_smtp {
                     send_methods.push("smtp_send_message");
+                    send_methods.push("smtp_send_draft");
                 }
                 if has_graph {
                     send_methods.push("graph_send_message");
@@ -635,6 +659,82 @@ impl MailImapServer {
         )
     }
 
+    /// Tool: Create a draft in the account's Drafts mailbox.
+    #[tool(
+        name = "imap_create_draft",
+        description = "Create a draft in the account's Drafts mailbox"
+    )]
+    async fn create_draft(
+        &self,
+        Parameters(input): Parameters<CreateDraftInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        finalize_tool(
+            started,
+            "imap_create_draft",
+            self.create_draft_impl(input)
+                .await
+                .map(|data| ("Draft created".to_owned(), data)),
+        )
+    }
+
+    /// Tool: Read a stored draft.
+    #[tool(
+        name = "imap_get_draft",
+        description = "Read a stored draft and return its editable fields"
+    )]
+    async fn get_draft(
+        &self,
+        Parameters(input): Parameters<ReadDraftInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        finalize_tool(
+            started,
+            "imap_get_draft",
+            self.get_draft_impl(input)
+                .await
+                .map(|data| ("Draft retrieved".to_owned(), data)),
+        )
+    }
+
+    /// Tool: Replace an existing draft with new content.
+    #[tool(
+        name = "imap_update_draft",
+        description = "Replace an existing draft with new content"
+    )]
+    async fn update_draft(
+        &self,
+        Parameters(input): Parameters<UpdateDraftInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        finalize_tool(
+            started,
+            "imap_update_draft",
+            self.update_draft_impl(input)
+                .await
+                .map(|data| ("Draft updated".to_owned(), data)),
+        )
+    }
+
+    /// Tool: Delete a draft.
+    #[tool(
+        name = "imap_delete_draft",
+        description = "Delete a stored draft from the Drafts mailbox"
+    )]
+    async fn delete_draft(
+        &self,
+        Parameters(input): Parameters<DeleteDraftInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        finalize_tool(
+            started,
+            "imap_delete_draft",
+            self.delete_draft_impl(input)
+                .await
+                .map(|data| ("Draft deleted".to_owned(), data)),
+        )
+    }
+
     /// Tool: Search and move messages in one operation
     ///
     /// Combines IMAP SEARCH + MOVE to avoid round-trip overhead. Searches the
@@ -686,6 +786,20 @@ impl MailImapServer {
     }
 
     // ─── SMTP Tools ──────────────────────────────────────────────────────────
+
+    /// Tool: Send a stored draft via SMTP
+    #[tool(
+        name = "smtp_send_draft",
+        description = "Send a stored draft via SMTP and remove it from Drafts"
+    )]
+    async fn smtp_send_draft(
+        &self,
+        Parameters(input): Parameters<SendDraftInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = self.smtp_send_draft_impl(input).await;
+        finalize_tool(started, "smtp_send_draft", result)
+    }
 
     /// Tool: Send a new email via SMTP
     #[tool(name = "smtp_send_message", description = "Send a new email via SMTP")]
@@ -3200,7 +3314,198 @@ impl MailImapServer {
         }))
     }
 
+    async fn create_draft_impl(&self, input: CreateDraftInput) -> AppResult<serde_json::Value> {
+        require_write_enabled(&self.config)?;
+        validate_account_id(&input.account_id)?;
+        validate_draft_content(&input.draft)?;
+
+        let stored = self
+            .store_draft(&input.account_id, None, &input.draft)
+            .await?;
+
+        Ok(serde_json::json!({
+            "status": "ok",
+            "account_id": input.account_id,
+            "mailbox": stored.mailbox,
+            "draft_id": stored.draft_id,
+            "message_id_header": stored.header_message_id,
+            "size_bytes": stored.size_bytes,
+        }))
+    }
+
+    async fn get_draft_impl(&self, input: ReadDraftInput) -> AppResult<serde_json::Value> {
+        validate_account_id(&input.account_id)?;
+        let msg_id = parse_and_validate_draft_id(&input.account_id, &input.draft_id)?;
+
+        let account = self.config.get_account(&input.account_id)?;
+        let mut session =
+            imap::connect_authenticated(&self.config, account, self.token_manager.as_deref())
+                .await?;
+        ensure_uidvalidity_matches_readonly(&self.config, &mut session, &msg_id).await?;
+
+        let flags = imap::fetch_flags(&self.config, &mut session, msg_id.uid).await?;
+        let raw = imap::fetch_raw_message(&self.config, &mut session, msg_id.uid).await?;
+        let parsed = parse_draft_contents(&raw)?;
+
+        Ok(serde_json::json!({
+            "status": "ok",
+            "account_id": input.account_id,
+            "draft": {
+                "draft_id": msg_id.encode(),
+                "mailbox": msg_id.mailbox,
+                "uidvalidity": msg_id.uidvalidity,
+                "uid": msg_id.uid,
+                "to": parsed.to,
+                "cc": parsed.cc,
+                "bcc": parsed.bcc,
+                "subject": parsed.subject,
+                "reply_to": parsed.reply_to,
+                "in_reply_to": parsed.in_reply_to,
+                "references": parsed.references,
+                "body_text": parsed.body_text,
+                "body_html": parsed.body_html,
+                "flags": flags,
+                "attachments": parsed.attachment_info,
+                "size_bytes": raw.len(),
+            }
+        }))
+    }
+
+    async fn update_draft_impl(&self, input: UpdateDraftInput) -> AppResult<serde_json::Value> {
+        require_write_enabled(&self.config)?;
+        validate_account_id(&input.account_id)?;
+        validate_draft_content(&input.draft)?;
+
+        let existing = parse_and_validate_draft_id(&input.account_id, &input.draft_id)?;
+        let stored = self
+            .store_draft(
+                &input.account_id,
+                Some(existing.mailbox.as_str()),
+                &input.draft,
+            )
+            .await?;
+
+        let delete_issue = self
+            .delete_message_by_locator(&input.account_id, &existing)
+            .await
+            .err()
+            .map(|error| error.to_string());
+
+        Ok(serde_json::json!({
+            "status": if delete_issue.is_some() { "partial" } else { "ok" },
+            "account_id": input.account_id,
+            "mailbox": stored.mailbox,
+            "replaced_draft_id": existing.encode(),
+            "draft_id": stored.draft_id,
+            "message_id_header": stored.header_message_id,
+            "size_bytes": stored.size_bytes,
+            "delete_issue": delete_issue,
+        }))
+    }
+
+    async fn delete_draft_impl(&self, input: DeleteDraftInput) -> AppResult<serde_json::Value> {
+        require_write_enabled(&self.config)?;
+        validate_account_id(&input.account_id)?;
+        if !input.confirm {
+            return Err(AppError::InvalidInput(
+                "delete requires confirm=true".to_owned(),
+            ));
+        }
+
+        let msg_id = parse_and_validate_draft_id(&input.account_id, &input.draft_id)?;
+        self.delete_message_by_locator(&input.account_id, &msg_id)
+            .await?;
+
+        Ok(serde_json::json!({
+            "status": "ok",
+            "account_id": input.account_id,
+            "draft_id": msg_id.encode(),
+            "mailbox": msg_id.mailbox,
+        }))
+    }
+
     // ─── SMTP impl methods ───────────────────────────────────────────────────
+
+    async fn smtp_send_draft_impl(
+        &self,
+        input: SendDraftInput,
+    ) -> AppResult<(String, serde_json::Value)> {
+        require_smtp_write_enabled(&self.config)?;
+        validate_account_id(&input.account_id)?;
+
+        let msg_id = parse_and_validate_draft_id(&input.account_id, &input.draft_id)?;
+        let raw = self
+            .fetch_message_raw_by_locator(&input.account_id, &msg_id)
+            .await?;
+        let parsed = parse_draft_contents(&raw)?;
+
+        let recipients_count = parsed.to.len() + parsed.cc.len() + parsed.bcc.len();
+        if recipients_count == 0 {
+            return Err(AppError::InvalidInput(
+                "draft must have at least one recipient before sending".to_owned(),
+            ));
+        }
+        validate_email_recipients(&parsed.to, "to")?;
+        if !parsed.cc.is_empty() {
+            validate_email_recipients(&parsed.cc, "cc")?;
+        }
+        if !parsed.bcc.is_empty() {
+            validate_email_recipients(&parsed.bcc, "bcc")?;
+        }
+
+        let smtp_config = self.config.get_smtp_account(&input.account_id)?;
+        let composition = smtp::EmailComposition {
+            from: smtp_config.user.clone(),
+            to: parsed.to,
+            cc: parsed.cc,
+            bcc: parsed.bcc,
+            subject: parsed.subject,
+            body_text: parsed.body_text,
+            body_html: parsed.body_html,
+            reply_to: parsed.reply_to,
+            in_reply_to: parsed.in_reply_to,
+            references: parsed.references,
+            attachments: parsed.attachments,
+        };
+
+        let sent = smtp::send_email(
+            smtp_config,
+            self.token_manager.as_deref(),
+            self.config.smtp_connect_timeout_ms,
+            self.config.smtp_send_timeout_ms,
+            &composition,
+        )
+        .await?;
+
+        if self.config.smtp_save_sent
+            && let Err(error) = self
+                .save_to_sent_folder(&input.account_id, &sent.rfc822)
+                .await
+        {
+            warn!(
+                account_id = input.account_id,
+                "failed to save sent draft copy to IMAP Sent folder: {error}"
+            );
+        }
+
+        let delete_issue = self
+            .delete_message_by_locator(&input.account_id, &msg_id)
+            .await
+            .err()
+            .map(|error| error.to_string());
+
+        let summary = format!("Draft sent to {recipients_count} recipient(s)");
+        let data = serde_json::json!({
+            "status": if delete_issue.is_some() { "partial" } else { "ok" },
+            "account_id": input.account_id,
+            "draft_id": msg_id.encode(),
+            "sent_message_id": sent.message_id,
+            "recipients_count": recipients_count,
+            "draft_deleted": delete_issue.is_none(),
+            "delete_issue": delete_issue,
+        });
+        Ok((summary, data))
+    }
 
     async fn smtp_send_message_impl(
         &self,
@@ -3620,6 +3925,111 @@ impl MailImapServer {
         Ok((summary, data))
     }
 
+    async fn store_draft(
+        &self,
+        account_id: &str,
+        mailbox_override: Option<&str>,
+        draft: &crate::models::DraftContentInput,
+    ) -> AppResult<StoredDraft> {
+        let account = self.config.get_account(account_id)?;
+        let from = self
+            .config
+            .get_smtp_account(account_id)
+            .map(|smtp_config| smtp_config.user.clone())
+            .unwrap_or_else(|_| account.user.clone());
+        let attachments = decode_attachments(&draft.attachments)?;
+        let composition = smtp::EmailComposition {
+            from,
+            to: draft.to.clone(),
+            cc: draft.cc.clone(),
+            bcc: draft.bcc.clone(),
+            subject: draft.subject.clone().unwrap_or_default(),
+            body_text: draft.body_text.clone(),
+            body_html: draft.body_html.clone(),
+            reply_to: draft.reply_to.clone(),
+            in_reply_to: draft.in_reply_to.clone(),
+            references: draft.references.clone(),
+            attachments,
+        };
+        let rendered = smtp::render_message(&composition)?;
+        let rendered_rfc822 = inject_draft_bcc_header(rendered.rfc822, &draft.bcc);
+
+        let mut session =
+            imap::connect_authenticated(&self.config, account, self.token_manager.as_deref())
+                .await?;
+        let mailbox = if let Some(mailbox) = mailbox_override {
+            mailbox.to_owned()
+        } else {
+            self.find_drafts_folder(&mut session).await?
+        };
+
+        imap::append_with_flags(
+            &self.config,
+            &mut session,
+            &mailbox,
+            Some("(\\Draft)"),
+            &rendered_rfc822,
+        )
+        .await?;
+        let draft_id = locate_message_id_in_mailbox(
+            &self.config,
+            &mut session,
+            account_id,
+            &mailbox,
+            &rendered.message_id,
+        )
+        .await?;
+
+        Ok(StoredDraft {
+            mailbox,
+            draft_id,
+            header_message_id: rendered.message_id,
+            size_bytes: rendered_rfc822.len(),
+        })
+    }
+
+    async fn find_drafts_folder(&self, session: &mut imap::ImapSession) -> AppResult<String> {
+        let mailboxes = imap::list_all_mailboxes(&self.config, session).await?;
+        Ok(mailboxes
+            .iter()
+            .map(|mailbox| mailbox.name().to_owned())
+            .find(|name| is_draft_folder_name(name))
+            .unwrap_or_else(|| "Drafts".to_owned()))
+    }
+
+    async fn fetch_message_raw_by_locator(
+        &self,
+        account_id: &str,
+        msg_id: &MessageId,
+    ) -> AppResult<Vec<u8>> {
+        let account = self.config.get_account(account_id)?;
+        let mut session =
+            imap::connect_authenticated(&self.config, account, self.token_manager.as_deref())
+                .await?;
+        ensure_uidvalidity_matches_readonly(&self.config, &mut session, msg_id).await?;
+        imap::fetch_raw_message(&self.config, &mut session, msg_id.uid).await
+    }
+
+    async fn delete_message_by_locator(
+        &self,
+        account_id: &str,
+        msg_id: &MessageId,
+    ) -> AppResult<()> {
+        let account = self.config.get_account(account_id)?;
+        let mut session =
+            imap::connect_authenticated(&self.config, account, self.token_manager.as_deref())
+                .await?;
+        ensure_uidvalidity_matches_readwrite(&self.config, &mut session, msg_id).await?;
+        imap::uid_store(
+            &self.config,
+            &mut session,
+            msg_id.uid,
+            "+FLAGS.SILENT (\\Deleted)",
+        )
+        .await?;
+        imap::uid_expunge(&self.config, &mut session, msg_id.uid).await
+    }
+
     /// Save a sent message to the IMAP Sent folder.
     ///
     /// Attempts to detect the correct Sent folder name for the provider.
@@ -3842,6 +4252,199 @@ fn part_metadata_from_mime_headers(mime_headers: &[u8]) -> (String, Option<Strin
     });
 
     (content_type, disp_filename.or(ct_filename))
+        }
+    }
+}
+
+fn is_draft_folder_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "draft"
+            | "drafts"
+            | "borrador"
+            | "borradores"
+            | "rascunho"
+            | "rascunhos"
+            | "bozza"
+            | "bozze"
+            | "brouillon"
+            | "brouillons"
+            | "entwurf"
+            | "entwürfe"
+            | "entwurfe"
+            | "concepts"
+    ) || lower.ends_with("/draft")
+        || lower.ends_with("/drafts")
+        || lower.ends_with("/borrador")
+        || lower.ends_with("/borradores")
+        || lower.ends_with("/rascunho")
+        || lower.ends_with("/rascunhos")
+        || lower.ends_with("/bozza")
+        || lower.ends_with("/bozze")
+        || lower.ends_with("/brouillon")
+        || lower.ends_with("/brouillons")
+        || lower.contains("[gmail]/draft")
+}
+
+async fn locate_message_id_in_mailbox(
+    config: &ServerConfig,
+    session: &mut imap::ImapSession,
+    account_id: &str,
+    mailbox: &str,
+    header_message_id: &str,
+) -> AppResult<String> {
+    let uidvalidity = imap::select_mailbox_readonly(config, session, mailbox).await?;
+    let query = format!(
+        "HEADER Message-ID \"{}\"",
+        escape_imap_quoted(header_message_id)?
+    );
+    let mut matches = imap::uid_search(config, session, &query).await?;
+    let uid = matches.pop().ok_or_else(|| {
+        AppError::NotFound(format!(
+            "appended message with Message-ID '{header_message_id}' not found in mailbox '{mailbox}'"
+        ))
+    })?;
+    Ok(MessageId {
+        account_id: account_id.to_owned(),
+        mailbox: mailbox.to_owned(),
+        uidvalidity,
+        uid,
+    }
+    .encode())
+}
+
+fn parse_and_validate_draft_id(account_id: &str, draft_id: &str) -> AppResult<MessageId> {
+    let msg_id = parse_and_validate_message_id(account_id, draft_id)?;
+    if !is_draft_folder_name(&msg_id.mailbox) {
+        return Err(AppError::InvalidInput(format!(
+            "draft_id must refer to a Drafts mailbox, got '{}'",
+            msg_id.mailbox
+        )));
+    }
+    Ok(msg_id)
+}
+
+fn validate_optional_recipients(addrs: &[String], field: &str) -> AppResult<()> {
+    if !addrs.is_empty() {
+        validate_email_recipients(addrs, field)?;
+    }
+    Ok(())
+}
+
+fn validate_draft_content(input: &crate::models::DraftContentInput) -> AppResult<()> {
+    validate_optional_recipients(&input.to, "to")?;
+    validate_optional_recipients(&input.cc, "cc")?;
+    validate_optional_recipients(&input.bcc, "bcc")?;
+    if let Some(subject) = &input.subject
+        && subject.len() > 998
+    {
+        return Err(AppError::invalid("subject must be at most 998 characters"));
+    }
+    if let Some(reply_to) = &input.reply_to {
+        validate_email_recipients(std::slice::from_ref(reply_to), "reply_to")?;
+    }
+    Ok(())
+}
+
+fn parse_header_value(parsed: &mailparse::ParsedMail<'_>, header_name: &str) -> Option<String> {
+    parsed
+        .headers
+        .iter()
+        .find(|header| header.get_key().eq_ignore_ascii_case(header_name))
+        .map(|header| header.get_value())
+}
+
+fn parse_header_addresses(
+    parsed: &mailparse::ParsedMail<'_>,
+    header_name: &str,
+) -> AppResult<Vec<String>> {
+    let Some(header) = parsed
+        .headers
+        .iter()
+        .find(|header| header.get_key().eq_ignore_ascii_case(header_name))
+    else {
+        return Ok(Vec::new());
+    };
+
+    match mailparse::addrparse_header(header) {
+        Ok(addresses) => {
+            let mut values = Vec::new();
+            for address in addresses.iter() {
+                match address {
+                    mailparse::MailAddr::Single(single) => values.push(single.to_string()),
+                    mailparse::MailAddr::Group(group) => {
+                        for single in &group.addrs {
+                            values.push(single.to_string());
+                        }
+                    }
+                }
+            }
+            Ok(values)
+        }
+        Err(_) => {
+            let value = header.get_value();
+            Ok(value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_owned)
+                .collect())
+        }
+    }
+}
+
+fn inject_draft_bcc_header(rfc822: Vec<u8>, bcc: &[String]) -> Vec<u8> {
+    if bcc.is_empty()
+        || rfc822.starts_with(b"Bcc:")
+        || rfc822.windows(6).any(|window| window == b"\nBcc:")
+    {
+        return rfc822;
+    }
+
+    let crlf_header = format!("Bcc: {}\r\n", bcc.join(", "));
+    if let Some(separator) = rfc822.windows(4).position(|window| window == b"\r\n\r\n") {
+        let mut out = Vec::with_capacity(rfc822.len() + crlf_header.len());
+        out.extend_from_slice(&rfc822[..separator + 2]);
+        out.extend_from_slice(crlf_header.as_bytes());
+        out.extend_from_slice(&rfc822[separator + 2..]);
+        out
+    } else if let Some(separator) = rfc822.windows(2).position(|window| window == b"\n\n") {
+        let lf_header = format!("Bcc: {}\n", bcc.join(", "));
+        let mut out = Vec::with_capacity(rfc822.len() + lf_header.len());
+        out.extend_from_slice(&rfc822[..separator + 1]);
+        out.extend_from_slice(lf_header.as_bytes());
+        out.extend_from_slice(&rfc822[separator + 1..]);
+        out
+    } else {
+        let mut out = rfc822;
+        out.extend_from_slice(crlf_header.as_bytes());
+        out
+    }
+}
+
+fn parse_draft_contents(raw: &[u8]) -> AppResult<ParsedDraftContents> {
+    let parsed_mail = mailparse::parse_mail(raw)
+        .map_err(|error| AppError::Internal(format!("failed to parse draft: {error}")))?;
+    let structured = mime::parse_message(raw, 20_000, true, false, 0)?;
+
+    Ok(ParsedDraftContents {
+        to: parse_header_addresses(&parsed_mail, "To")?,
+        cc: parse_header_addresses(&parsed_mail, "Cc")?,
+        bcc: parse_header_addresses(&parsed_mail, "Bcc")?,
+        subject: structured.subject.unwrap_or_default(),
+        body_text: structured.body_text,
+        body_html: structured.body_html_sanitized,
+        reply_to: parse_header_value(&parsed_mail, "Reply-To"),
+        in_reply_to: parse_header_value(&parsed_mail, "In-Reply-To"),
+        references: parse_header_value(&parsed_mail, "References"),
+        attachments: extract_attachments_from_message(&parsed_mail),
+        attachment_info: structured
+            .attachments
+            .into_iter()
+            .take(MAX_ATTACHMENTS)
+            .collect(),
+    })
 }
 
 /// Calculate elapsed milliseconds
@@ -4751,10 +5354,12 @@ fn parse_bulk_message_ids(account_id: &str, message_ids: &[String]) -> AppResult
 /// Tests for server-side validation and encoding helpers.
 mod tests {
     use super::{
-        DeleteAction, delete_action_for_mailbox, encode_raw_source_base64, escape_imap_quoted,
-        is_label_mailbox, is_sent_folder_name, is_trash_mailbox, part_metadata_from_mime_headers,
-        validate_flag, validate_mailbox, validate_search_text,
+        delete_action_for_mailbox, DeleteAction, encode_raw_source_base64, escape_imap_quoted,
+        inject_draft_bcc_header, is_draft_folder_name, is_label_mailbox, is_sent_folder_name,
+        is_trash_mailbox, parse_and_validate_draft_id, parse_draft_contents,
+        part_metadata_from_mime_headers, validate_flag, validate_mailbox, validate_search_text
     };
+    use crate::smtp::{self, EmailAttachment, EmailComposition};
 
     #[test]
     fn trash_detection_covers_common_providers() {
@@ -4852,6 +5457,81 @@ mod tests {
         assert!(!is_sent_folder_name("Borrador"));
         assert!(!is_sent_folder_name("Archive"));
         assert!(!is_sent_folder_name(""));
+    }
+
+    #[test]
+    fn draft_folder_detection_covers_common_providers() {
+        assert!(is_draft_folder_name("Drafts"));
+        assert!(is_draft_folder_name("[Gmail]/Drafts"));
+        assert!(is_draft_folder_name("Borradores"));
+        assert!(is_draft_folder_name("Projects/Drafts"));
+        assert!(is_draft_folder_name("Brouillons"));
+    }
+
+    #[test]
+    fn draft_folder_detection_rejects_unrelated_names() {
+        assert!(!is_draft_folder_name("INBOX"));
+        assert!(!is_draft_folder_name("Sent"));
+        assert!(!is_draft_folder_name("Archive"));
+        assert!(!is_draft_folder_name(""));
+    }
+
+    #[test]
+    fn parse_draft_contents_round_trip_preserves_editable_fields() {
+        let rendered = smtp::render_message(&EmailComposition {
+            from: "sender@example.com".to_owned(),
+            to: vec!["Alice <alice@example.com>".to_owned()],
+            cc: vec!["Bob <bob@example.com>".to_owned()],
+            bcc: vec!["carol@example.com".to_owned()],
+            subject: "Draft subject".to_owned(),
+            body_text: Some("Plain draft body".to_owned()),
+            body_html: Some("<p>HTML draft body</p>".to_owned()),
+            reply_to: Some("reply@example.com".to_owned()),
+            in_reply_to: Some("<original@example.com>".to_owned()),
+            references: Some("<older@example.com> <original@example.com>".to_owned()),
+            attachments: vec![EmailAttachment {
+                filename: "notes.txt".to_owned(),
+                content_type: "text/plain".to_owned(),
+                content: b"draft attachment".to_vec(),
+            }],
+        })
+        .expect("message should render");
+
+        let with_bcc = inject_draft_bcc_header(rendered.rfc822, &["carol@example.com".to_owned()]);
+        let parsed = parse_draft_contents(&with_bcc).expect("draft should parse");
+        assert_eq!(parsed.to, vec![r#""Alice" <alice@example.com>"#.to_owned()]);
+        assert_eq!(parsed.cc, vec![r#""Bob" <bob@example.com>"#.to_owned()]);
+        assert_eq!(parsed.bcc, vec!["carol@example.com".to_owned()]);
+        assert_eq!(parsed.subject, "Draft subject");
+        assert_eq!(parsed.reply_to.as_deref(), Some("reply@example.com"));
+        assert_eq!(
+            parsed.in_reply_to.as_deref(),
+            Some("<original@example.com>")
+        );
+        assert_eq!(
+            parsed.references.as_deref(),
+            Some("<older@example.com> <original@example.com>")
+        );
+        assert_eq!(parsed.body_text.as_deref(), Some("Plain draft body"));
+        assert!(
+            parsed
+                .body_html
+                .as_deref()
+                .is_some_and(|html| html.contains("HTML draft body"))
+        );
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachment_info.len(), 1);
+        assert_eq!(
+            parsed.attachment_info[0].filename.as_deref(),
+            Some("notes.txt")
+        );
+    }
+
+    #[test]
+    fn parse_and_validate_draft_id_rejects_non_draft_mailbox() {
+        let err = parse_and_validate_draft_id("default", "imap:default:INBOX:1:10")
+            .expect_err("must reject non-draft mailbox");
+        assert!(err.to_string().contains("Drafts mailbox"));
     }
 
     /// Tests that control characters in search text are rejected.

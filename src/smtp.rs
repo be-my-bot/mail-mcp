@@ -110,6 +110,24 @@ pub struct SentMessage {
     pub rfc822: Vec<u8>,
 }
 
+/// Rendered RFC822 message suitable for storing as a draft.
+pub struct RenderedMessage {
+    pub message_id: String,
+    pub rfc822: Vec<u8>,
+}
+
+/// Render an email to RFC822 bytes without sending it.
+pub fn render_message(composition: &EmailComposition) -> AppResult<RenderedMessage> {
+    let message = build_message(composition)?;
+    let message_id = message
+        .headers()
+        .get_raw("Message-ID")
+        .unwrap_or_default()
+        .to_owned();
+    let rfc822 = message.formatted();
+    Ok(RenderedMessage { message_id, rfc822 })
+}
+
 /// Send an email via SMTP.
 ///
 /// Builds the MIME message and sends it through the configured SMTP transport.
