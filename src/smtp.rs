@@ -116,14 +116,17 @@ pub struct RenderedMessage {
     pub rfc822: Vec<u8>,
 }
 
+fn extract_message_id(message: &Message) -> AppResult<String> {
+    let raw = message.headers().get_raw("Message-ID").ok_or_else(|| {
+        AppError::Internal("rendered message missing Message-ID header".to_owned())
+    })?;
+    Ok(raw.to_owned())
+}
+
 /// Render an email to RFC822 bytes without sending it.
 pub fn render_message(composition: &EmailComposition) -> AppResult<RenderedMessage> {
     let message = build_message(composition)?;
-    let message_id = message
-        .headers()
-        .get_raw("Message-ID")
-        .unwrap_or_default()
-        .to_owned();
+    let message_id = extract_message_id(&message)?;
     let rfc822 = message.formatted();
     Ok(RenderedMessage { message_id, rfc822 })
 }
@@ -151,11 +154,7 @@ pub async fn send_email(
     composition: &EmailComposition,
 ) -> AppResult<SentMessage> {
     let message = build_message(composition)?;
-    let message_id = message
-        .headers()
-        .get_raw("Message-ID")
-        .unwrap_or_default()
-        .to_owned();
+    let message_id = extract_message_id(&message)?;
     // Serialize BEFORE sending so we can archive the exact bytes even though
     // `transport.send(message)` consumes the Message by value.
     let rfc822 = message.formatted();
@@ -223,7 +222,7 @@ fn build_message(comp: &EmailComposition) -> AppResult<Message> {
         AppError::InvalidInput(format!("invalid From address '{}': {e}", comp.from))
     })?;
 
-    let mut builder: MessageBuilder = Message::builder().from(from_mailbox);
+    let mut builder: MessageBuilder = Message::builder().from(from_mailbox).message_id(None);
 
     for addr in &comp.to {
         let mb: Mailbox = addr

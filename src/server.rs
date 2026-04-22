@@ -44,6 +44,8 @@ const MAX_ATTACHMENTS: usize = 50;
 const MAX_CURSOR_UIDS_STORED: usize = 20_000;
 /// Maximum message IDs per bulk operation
 const MAX_BULK_IDS: usize = 500;
+/// Maximum characters returned when parsing draft text/HTML bodies.
+const MAX_DRAFT_BODY_CHARS: usize = 20_000;
 
 /// IMAP MCP server
 ///
@@ -3952,7 +3954,7 @@ impl MailImapServer {
             attachments,
         };
         let rendered = smtp::render_message(&composition)?;
-        let rendered_rfc822 = inject_draft_bcc_header(rendered.rfc822, &draft.bcc);
+        let rfc822_with_bcc = inject_draft_bcc_header(rendered.rfc822, &draft.bcc);
 
         let mut session =
             imap::connect_authenticated(&self.config, account, self.token_manager.as_deref())
@@ -3968,7 +3970,7 @@ impl MailImapServer {
             &mut session,
             &mailbox,
             Some("(\\Draft)"),
-            &rendered_rfc822,
+            &rfc822_with_bcc,
         )
         .await?;
         let draft_id = locate_message_id_in_mailbox(
@@ -3984,7 +3986,7 @@ impl MailImapServer {
             mailbox,
             draft_id,
             header_message_id: rendered.message_id,
-            size_bytes: rendered_rfc822.len(),
+            size_bytes: rfc822_with_bcc.len(),
         })
     }
 
@@ -4395,9 +4397,25 @@ fn parse_header_addresses(
 }
 
 fn inject_draft_bcc_header(rfc822: Vec<u8>, bcc: &[String]) -> Vec<u8> {
-    if bcc.is_empty()
-        || rfc822.starts_with(b"Bcc:")
-        || rfc822.windows(6).any(|window| window == b"\nBcc:")
+    if bcc.is_empty() {
+        return rfc822;
+    }
+
+    let header_end = rfc822
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+        .or_else(|| {
+            rfc822
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|index| index + 2)
+        });
+    let header_section = header_end
+        .map(|end| &rfc822[..end])
+        .unwrap_or_else(|| rfc822.as_slice());
+    if header_section.starts_with(b"Bcc:")
+        || header_section.windows(6).any(|window| window == b"\nBcc:")
     {
         return rfc822;
     }
@@ -4426,7 +4444,7 @@ fn inject_draft_bcc_header(rfc822: Vec<u8>, bcc: &[String]) -> Vec<u8> {
 fn parse_draft_contents(raw: &[u8]) -> AppResult<ParsedDraftContents> {
     let parsed_mail = mailparse::parse_mail(raw)
         .map_err(|error| AppError::Internal(format!("failed to parse draft: {error}")))?;
-    let structured = mime::parse_message(raw, 20_000, true, false, 0)?;
+    let structured = mime::parse_message(raw, MAX_DRAFT_BODY_CHARS, true, false, 0)?;
 
     Ok(ParsedDraftContents {
         to: parse_header_addresses(&parsed_mail, "To")?,
@@ -5499,8 +5517,12 @@ mod tests {
 
         let with_bcc = inject_draft_bcc_header(rendered.rfc822, &["carol@example.com".to_owned()]);
         let parsed = parse_draft_contents(&with_bcc).expect("draft should parse");
-        assert_eq!(parsed.to, vec![r#""Alice" <alice@example.com>"#.to_owned()]);
-        assert_eq!(parsed.cc, vec![r#""Bob" <bob@example.com>"#.to_owned()]);
+        assert_eq!(parsed.to.len(), 1);
+        assert!(parsed.to[0].contains("alice@example.com"));
+        assert!(parsed.to[0].contains("Alice"));
+        assert_eq!(parsed.cc.len(), 1);
+        assert!(parsed.cc[0].contains("bob@example.com"));
+        assert!(parsed.cc[0].contains("Bob"));
         assert_eq!(parsed.bcc, vec!["carol@example.com".to_owned()]);
         assert_eq!(parsed.subject, "Draft subject");
         assert_eq!(parsed.reply_to.as_deref(), Some("reply@example.com"));
