@@ -3,6 +3,7 @@
 //! Implements the `ServerHandler` trait and registers 18 MCP tools. Handles
 //! input validation, business logic orchestration, and response formatting.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -24,11 +25,11 @@ use crate::mime;
 use crate::models::{
     AccountInfo, AccountOnlyInput, AppendMessageInput, AttachmentInput, BulkDeleteInput,
     BulkMoveInput, BulkUpdateFlagsInput, CopyMessageInput, CreateMailboxInput, DeleteMailboxInput,
-    DeleteMessageInput, GetMessageInput, GetMessageRawInput, GraphSendMessageInput, MailboxInfo,
-    MailboxStatusInfo, MailboxStatusInput, MessageDetail, MessageSummary, Meta, MoveMessageInput,
-    RenameMailboxInput, SearchAndDeleteInput, SearchAndMoveInput, SearchMessagesInput,
-    SmtpForwardMessageInput, SmtpReplyMessageInput, SmtpSendMessageInput, SmtpVerifyAccountInput,
-    ToolEnvelope, UpdateMessageFlagsInput,
+    DeleteMessageInput, GetAttachmentInput, GetMessageInput, GetMessageRawInput,
+    GraphSendMessageInput, MailboxInfo, MailboxStatusInfo, MailboxStatusInput, MessageDetail,
+    MessageSummary, Meta, MoveMessageInput, RenameMailboxInput, SearchAndDeleteInput,
+    SearchAndMoveInput, SearchMessagesInput, SmtpForwardMessageInput, SmtpReplyMessageInput,
+    SmtpSendMessageInput, SmtpVerifyAccountInput, ToolEnvelope, UpdateMessageFlagsInput,
 };
 use crate::pagination::{CursorEntry, CursorStore};
 use crate::smtp;
@@ -241,10 +242,11 @@ impl MailImapServer {
 
     /// Tool: List mailboxes for an account
     ///
-    /// Returns up to 200 visible mailboxes/folders.
+    /// Returns up to 200 visible mailboxes/folders (names + hierarchy
+    /// delimiters only — for unread counts use `imap_mailbox_status`).
     #[tool(
         name = "imap_list_mailboxes",
-        description = "List mailboxes for an account"
+        description = "List mailboxes (names + delimiters only; use imap_mailbox_status for unread counts)"
     )]
     async fn list_mailboxes(
         &self,
@@ -311,10 +313,13 @@ impl MailImapServer {
     /// Tool: Get bounded RFC822 message source
     ///
     /// Returns raw RFC822 bytes (as string) up to `max_bytes`. Useful for
-    /// diagnostics or tools that need full message source.
+    /// diagnostics or tools that need full message source. The plain `RFC822`
+    /// fetch marks the message as `\Seen`. On the Proton bridge, Sent is
+    /// auto-populated by SMTP sends — do not also enable
+    /// `MAIL_SMTP_SAVE_SENT`.
     #[tool(
         name = "imap_get_message_raw",
-        description = "Get bounded RFC822 source"
+        description = "Get bounded RFC822 source (marks message \\Seen; bridge auto-saves SMTP sends to Sent — do not also enable MAIL_SMTP_SAVE_SENT)"
     )]
     async fn get_message_raw(
         &self,
@@ -327,6 +332,33 @@ impl MailImapServer {
             self.get_message_raw_impl(input)
                 .await
                 .map(|data| ("Raw message retrieved".to_owned(), data)),
+        )
+    }
+
+    /// Tool: Get a message attachment
+    ///
+    /// Fetches attachment bytes without marking the message as read
+    /// (`BODY.PEEK`). Select the part by `part_id` (IMAP section numbering,
+    /// e.g. `1.2`) or by `filename` from the attachment list; an ambiguous
+    /// filename is rejected. With `save_to` (absolute path) the bytes are
+    /// written to disk and only metadata returned; otherwise they are
+    /// returned as base64 when under the inline cap
+    /// (`MAIL_ATTACHMENT_MAX_INLINE_BYTES`, default 256 KB).
+    #[tool(
+        name = "imap_get_attachment",
+        description = "Get a message attachment by part_id or filename — save_to an absolute path or get base64 (inline cap 256 KB, MAIL_ATTACHMENT_MAX_INLINE_BYTES)"
+    )]
+    async fn get_attachment(
+        &self,
+        Parameters(input): Parameters<GetAttachmentInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        finalize_tool(
+            started,
+            "imap_get_attachment",
+            self.get_attachment_impl(input)
+                .await
+                .map(|data| ("Attachment retrieved".to_owned(), data)),
         )
     }
 
@@ -356,7 +388,14 @@ impl MailImapServer {
     ///
     /// Copies message to same or different account. Cross-account copy uses
     /// `APPEND`. Requires `MAIL_IMAP_WRITE_ENABLED=true`.
-    #[tool(name = "imap_copy_message", description = "Copy a message to mailbox")]
+    ///
+    /// Labels are mailboxes: on the Proton bridge they live under
+    /// `Labels/<Name>` and adding a label is a COPY into that mailbox (the
+    /// original copy stays put). User folders live under `Folders/<Name>`.
+    #[tool(
+        name = "imap_copy_message",
+        description = "Copy a message to mailbox (labels are `Labels/<Name>` mailboxes — copy into one to add a label; folders live under `Folders/<Name>`)"
+    )]
     async fn copy_message(
         &self,
         Parameters(input): Parameters<CopyMessageInput>,
@@ -376,7 +415,16 @@ impl MailImapServer {
     /// Moves message within same account. Prefers `MOVE` capability,
     /// falls back to `COPY` + `DELETE`. Requires
     /// `MAIL_IMAP_WRITE_ENABLED=true`.
-    #[tool(name = "imap_move_message", description = "Move a message to mailbox")]
+    ///
+    /// Labels are mailboxes: on the Proton bridge they live under
+    /// `Labels/<Name>` and user folders under `Folders/<Name>`. Moving into a
+    /// label adds it to the message; removing a label is `imap_delete_message`
+    /// inside the label mailbox (expunges only the label copy — the
+    /// INBOX/All Mail copy survives).
+    #[tool(
+        name = "imap_move_message",
+        description = "Move a message to mailbox (labels are `Labels/<Name>` mailboxes, folders `Folders/<Name>`)"
+    )]
     async fn move_message(
         &self,
         Parameters(input): Parameters<MoveMessageInput>,
@@ -393,9 +441,20 @@ impl MailImapServer {
 
     /// Tool: Delete message from mailbox
     ///
-    /// Marks message as `\Deleted` and immediately expunges. Requires
-    /// explicit `confirm=true` and `MAIL_IMAP_WRITE_ENABLED=true`.
-    #[tool(name = "imap_delete_message", description = "Delete a message")]
+    /// Requires explicit `confirm=true` and `MAIL_IMAP_WRITE_ENABLED=true`.
+    ///
+    /// Semantics (Proton bridge): a message already in Trash is permanently
+    /// deleted (`\Deleted` + expunge). Anywhere else the message is MOVED to
+    /// Trash — reversible, not permanent. Permanent delete works ONLY from
+    /// Trash; perma-delete from Spam is refused by the bridge, so the caller
+    /// must move the message to Trash first and delete there. All Mail
+    /// refuses EXPUNGE/MOVE. In a label mailbox (`Labels/<Name>`) delete
+    /// removes the label: `\Deleted` + expunge inside the label mailbox,
+    /// leaving the INBOX/All Mail copy intact.
+    #[tool(
+        name = "imap_delete_message",
+        description = "Delete a message (permanent only from Trash; otherwise moves to Trash — Spam must be moved to Trash first)"
+    )]
     async fn delete_message(
         &self,
         Parameters(input): Parameters<DeleteMessageInput>,
@@ -513,9 +572,13 @@ impl MailImapServer {
     ///
     /// Deletes up to 500 messages at once. All messages must be from the same
     /// mailbox. Requires explicit `confirm=true` and `MAIL_IMAP_WRITE_ENABLED=true`.
+    ///
+    /// Permanent delete works ONLY from Trash; from any other mailbox the
+    /// messages are moved to Trash (reversible). All Mail refuses
+    /// EXPUNGE/MOVE; Spam perma-delete is refused by the bridge.
     #[tool(
         name = "imap_bulk_delete",
-        description = "Delete up to 500 messages in one operation"
+        description = "Delete up to 500 messages in one operation (permanent only from Trash; otherwise moves to Trash)"
     )]
     async fn bulk_delete(
         &self,
@@ -552,10 +615,11 @@ impl MailImapServer {
     /// Tool: Append a raw RFC822 message to a mailbox
     ///
     /// Inserts a message into the specified mailbox. Requires
-    /// `MAIL_IMAP_WRITE_ENABLED=true`.
+    /// `MAIL_IMAP_WRITE_ENABLED=true`. On the Proton bridge APPEND is safe up
+    /// to ~10 MB; 30 MB messages are rejected by the import API.
     #[tool(
         name = "imap_append_message",
-        description = "Append a raw RFC822 message to a mailbox"
+        description = "Append a raw RFC822 message to a mailbox (bridge-safe up to ~10 MB; 30 MB rejected)"
     )]
     async fn append_message(
         &self,
@@ -597,11 +661,15 @@ impl MailImapServer {
     /// Tool: Search and delete messages in one operation
     ///
     /// Combines IMAP SEARCH + DELETE to avoid round-trip overhead. Searches the
-    /// source mailbox and deletes up to 500 matching messages.
+    /// source mailbox and processes up to 500 matching messages.
     /// Requires `MAIL_IMAP_WRITE_ENABLED=true` and `confirm=true`.
+    ///
+    /// Permanent delete works ONLY from Trash; from any other mailbox the
+    /// matches are moved to Trash (reversible). All Mail refuses
+    /// EXPUNGE/MOVE; Spam perma-delete is refused by the bridge.
     #[tool(
         name = "imap_search_and_delete",
-        description = "Search messages and delete matches in one operation (up to 500)"
+        description = "Search messages and delete matches in one operation (up to 500; permanent only from Trash, otherwise moved to Trash)"
     )]
     async fn search_and_delete(
         &self,
@@ -1625,6 +1693,165 @@ impl MailImapServer {
         }))
     }
 
+    async fn get_attachment_impl(&self, input: GetAttachmentInput) -> AppResult<serde_json::Value> {
+        validate_account_id(&input.account_id)?;
+        if input.part_id.is_none() && input.filename.is_none() {
+            return Err(AppError::InvalidInput(
+                "provide part_id or filename".to_owned(),
+            ));
+        }
+        if let Some(part_id) = &input.part_id {
+            imap::parse_section_digits(part_id)?;
+        }
+        let save_to = input
+            .save_to
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(path) = save_to
+            && !Path::new(path).is_absolute()
+        {
+            return Err(AppError::InvalidInput(
+                "save_to must be an absolute path".to_owned(),
+            ));
+        }
+
+        let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
+        let encoded_message_id = msg_id.encode();
+
+        let account = self.config.get_account(&input.account_id)?;
+        let mut issues = Vec::new();
+        let mut session =
+            match imap::connect_authenticated(&self.config, account, self.token_manager.as_deref())
+                .await
+            {
+                Ok(session) => session,
+                Err(error) => {
+                    issues.push(
+                        ToolIssue::from_error("connect_authenticated", &error)
+                            .with_message_id(&encoded_message_id),
+                    );
+                    log_runtime_issues(
+                        "imap_get_attachment",
+                        "failed",
+                        &input.account_id,
+                        Some(&msg_id.mailbox),
+                        &issues,
+                    );
+                    return Ok(serde_json::json!({
+                        "status": "failed",
+                        "issues": issues,
+                        "account_id": input.account_id,
+                        "message_id": encoded_message_id,
+                        "attachment": serde_json::Value::Null,
+                    }));
+                }
+            };
+        ensure_uidvalidity_matches_readonly(&self.config, &mut session, &msg_id).await?;
+
+        let (info, bytes) = match resolve_attachment_bytes(
+            &self.config,
+            &mut session,
+            msg_id.uid,
+            input.part_id.as_deref(),
+            input.filename.as_deref(),
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("resolve_attachment", &error)
+                        .with_uid(msg_id.uid)
+                        .with_message_id(&encoded_message_id),
+                );
+                log_runtime_issues(
+                    "imap_get_attachment",
+                    "failed",
+                    &input.account_id,
+                    Some(&msg_id.mailbox),
+                    &issues,
+                );
+                return Ok(serde_json::json!({
+                    "status": "failed",
+                    "issues": issues,
+                    "account_id": input.account_id,
+                    "message_id": encoded_message_id,
+                    "attachment": serde_json::Value::Null,
+                }));
+            }
+        };
+
+        let attachment_metadata = serde_json::json!({
+            "filename": info.filename,
+            "content_type": info.content_type,
+            "size_bytes": info.size_bytes,
+            "part_id": info.part_id,
+        });
+
+        if let Some(path) = save_to {
+            if let Some(parent) = Path::new(path).parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    AppError::Internal(format!(
+                        "failed to create parent directories for '{path}': {e}"
+                    ))
+                })?;
+            }
+            std::fs::write(path, &bytes)
+                .map_err(|e| AppError::Internal(format!("failed to write '{path}': {e}")))?;
+
+            log_runtime_issues(
+                "imap_get_attachment",
+                "ok",
+                &input.account_id,
+                Some(&msg_id.mailbox),
+                &issues,
+            );
+            return Ok(serde_json::json!({
+                "status": "ok",
+                "issues": issues,
+                "account_id": input.account_id,
+                "message_id": encoded_message_id,
+                "saved": {
+                    "path": path,
+                    "filename": attachment_metadata["filename"],
+                    "content_type": attachment_metadata["content_type"],
+                    "size_bytes": attachment_metadata["size_bytes"],
+                },
+            }));
+        }
+
+        let cap = self.config.attachment_max_inline_bytes;
+        if bytes.len() > cap {
+            return Err(AppError::InvalidInput(format!(
+                "attachment is {} bytes, over the {cap} byte inline cap; use save_to or raise MAIL_ATTACHMENT_MAX_INLINE_BYTES",
+                bytes.len()
+            )));
+        }
+
+        log_runtime_issues(
+            "imap_get_attachment",
+            "ok",
+            &input.account_id,
+            Some(&msg_id.mailbox),
+            &issues,
+        );
+        Ok(serde_json::json!({
+            "status": "ok",
+            "issues": issues,
+            "account_id": input.account_id,
+            "message_id": encoded_message_id,
+            "attachment": {
+                "filename": attachment_metadata["filename"],
+                "content_type": attachment_metadata["content_type"],
+                "size_bytes": attachment_metadata["size_bytes"],
+                "part_id": attachment_metadata["part_id"],
+                "content_base64": encode_raw_source_base64(&bytes),
+                "content_encoding": "base64",
+            },
+        }))
+    }
+
     async fn update_flags_impl(
         &self,
         input: UpdateMessageFlagsInput,
@@ -2210,36 +2437,170 @@ impl MailImapServer {
             };
         ensure_uidvalidity_matches_readwrite(&self.config, &mut session, &msg_id).await?;
 
-        steps_attempted += 1;
-        let flagged_deleted = if let Err(error) = imap::uid_store(
-            &self.config,
-            &mut session,
-            msg_id.uid,
-            "+FLAGS.SILENT (\\Deleted)",
-        )
-        .await
-        {
-            issues.push(
-                ToolIssue::from_error("uid_store_deleted", &error)
-                    .with_uid(msg_id.uid)
-                    .with_message_id(&encoded_message_id),
-            );
-            false
-        } else {
-            steps_succeeded += 1;
-            true
-        };
+        let action = delete_action_for_mailbox(&msg_id.mailbox);
+        let mut trash_mailbox: Option<String> = None;
 
-        if flagged_deleted {
+        if let DeleteAction::MoveToTrash = action {
+            // Outside Trash a delete must NOT expunge in place: on the Proton
+            // bridge that silently orphans the message. Move to Trash instead
+            // (reversible); permanent delete happens on the Trash copy.
+            let trash = match resolve_trash_mailbox(&self.config, &mut session).await {
+                Ok(trash) => trash,
+                Err(error) => {
+                    issues.push(
+                        ToolIssue::from_error("list_all_mailboxes", &error)
+                            .with_uid(msg_id.uid)
+                            .with_message_id(&encoded_message_id),
+                    );
+                    log_runtime_issues(
+                        "imap_delete_message",
+                        "failed",
+                        &input.account_id,
+                        Some(&msg_id.mailbox),
+                        &issues,
+                    );
+                    return Ok(serde_json::json!({
+                        "status": "failed",
+                        "issues": issues,
+                        "account_id": input.account_id,
+                        "mailbox": msg_id.mailbox,
+                        "message_id": encoded_message_id,
+                        "steps_attempted": steps_attempted,
+                        "steps_succeeded": steps_succeeded,
+                    }));
+                }
+            };
+            trash_mailbox = Some(trash.clone());
+
+            let caps = match imap::capabilities(&self.config, &mut session).await {
+                Ok(caps) => caps,
+                Err(error) => {
+                    issues.push(
+                        ToolIssue::from_error("capabilities", &error)
+                            .with_uid(msg_id.uid)
+                            .with_message_id(&encoded_message_id),
+                    );
+                    log_runtime_issues(
+                        "imap_delete_message",
+                        "failed",
+                        &input.account_id,
+                        Some(&msg_id.mailbox),
+                        &issues,
+                    );
+                    return Ok(serde_json::json!({
+                        "status": "failed",
+                        "issues": issues,
+                        "account_id": input.account_id,
+                        "mailbox": msg_id.mailbox,
+                        "message_id": encoded_message_id,
+                        "steps_attempted": steps_attempted,
+                        "steps_succeeded": steps_succeeded,
+                    }));
+                }
+            };
+
+            if caps.has_str("MOVE") {
+                steps_attempted += 1;
+                if let Err(error) =
+                    imap::uid_move(&self.config, &mut session, msg_id.uid, &trash).await
+                {
+                    issues.push(
+                        ToolIssue::from_error("uid_move", &error)
+                            .with_uid(msg_id.uid)
+                            .with_message_id(&encoded_message_id),
+                    );
+                } else {
+                    steps_succeeded += 1;
+                }
+            } else {
+                // No MOVE capability: COPY to Trash, then expunge the source uid.
+                steps_attempted += 1;
+                let copied = if let Err(error) =
+                    imap::uid_copy(&self.config, &mut session, msg_id.uid, &trash).await
+                {
+                    issues.push(
+                        ToolIssue::from_error("uid_copy", &error)
+                            .with_uid(msg_id.uid)
+                            .with_message_id(&encoded_message_id),
+                    );
+                    false
+                } else {
+                    steps_succeeded += 1;
+                    true
+                };
+
+                if copied {
+                    steps_attempted += 1;
+                    let flagged_deleted = if let Err(error) = imap::uid_store(
+                        &self.config,
+                        &mut session,
+                        msg_id.uid,
+                        "+FLAGS.SILENT (\\Deleted)",
+                    )
+                    .await
+                    {
+                        issues.push(
+                            ToolIssue::from_error("uid_store_deleted", &error)
+                                .with_uid(msg_id.uid)
+                                .with_message_id(&encoded_message_id),
+                        );
+                        false
+                    } else {
+                        steps_succeeded += 1;
+                        true
+                    };
+
+                    if flagged_deleted {
+                        steps_attempted += 1;
+                        if let Err(error) =
+                            imap::uid_expunge(&self.config, &mut session, msg_id.uid).await
+                        {
+                            issues.push(
+                                ToolIssue::from_error("uid_expunge", &error)
+                                    .with_uid(msg_id.uid)
+                                    .with_message_id(&encoded_message_id),
+                            );
+                        } else {
+                            steps_succeeded += 1;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Trash (permanent) or label mailbox (label removal):
+            // \Deleted + UID EXPUNGE in place.
             steps_attempted += 1;
-            if let Err(error) = imap::uid_expunge(&self.config, &mut session, msg_id.uid).await {
+            let flagged_deleted = if let Err(error) = imap::uid_store(
+                &self.config,
+                &mut session,
+                msg_id.uid,
+                "+FLAGS.SILENT (\\Deleted)",
+            )
+            .await
+            {
                 issues.push(
-                    ToolIssue::from_error("uid_expunge", &error)
+                    ToolIssue::from_error("uid_store_deleted", &error)
                         .with_uid(msg_id.uid)
                         .with_message_id(&encoded_message_id),
                 );
+                false
             } else {
                 steps_succeeded += 1;
+                true
+            };
+
+            if flagged_deleted {
+                steps_attempted += 1;
+                if let Err(error) = imap::uid_expunge(&self.config, &mut session, msg_id.uid).await
+                {
+                    issues.push(
+                        ToolIssue::from_error("uid_expunge", &error)
+                            .with_uid(msg_id.uid)
+                            .with_message_id(&encoded_message_id),
+                    );
+                } else {
+                    steps_succeeded += 1;
+                }
             }
         }
 
@@ -2252,12 +2613,25 @@ impl MailImapServer {
             &issues,
         );
 
+        let note = match action {
+            DeleteAction::MoveToTrash => Some(
+                "Message moved to Trash (reversible). Permanent delete works only from Trash: run imap_delete_message again on the Trash copy. Perma-delete from Spam is refused by the bridge — the message must be moved to Trash first.".to_owned(),
+            ),
+            DeleteAction::Permanent => None,
+            DeleteAction::RemoveLabel => Some(
+                "Label removed: the label copy was expunged inside the label mailbox; the INBOX/All Mail copy survives.".to_owned(),
+            ),
+        };
+
         Ok(serde_json::json!({
             "status": status,
             "issues": issues,
             "account_id": input.account_id,
             "mailbox": msg_id.mailbox,
             "message_id": encoded_message_id,
+            "action": action.as_str(),
+            "trash_mailbox": trash_mailbox,
+            "note": note,
             "steps_attempted": steps_attempted,
             "steps_succeeded": steps_succeeded,
         }))
@@ -2532,14 +2906,38 @@ impl MailImapServer {
             ));
         }
 
-        imap::uid_store_bulk(
-            &self.config,
-            &mut session,
-            &uid_set,
-            "+FLAGS.SILENT (\\Deleted)",
-        )
-        .await?;
-        imap::uid_expunge_bulk(&self.config, &mut session, &uid_set).await?;
+        let action = delete_action_for_mailbox(&input.mailbox);
+        let mut trash_mailbox: Option<String> = None;
+        if let DeleteAction::MoveToTrash = action {
+            // Outside Trash, expunging in place silently orphans the message
+            // on the Proton bridge — move to Trash instead (reversible).
+            let trash = resolve_trash_mailbox(&self.config, &mut session).await?;
+            let caps = imap::capabilities(&self.config, &mut session).await?;
+            if caps.has_str("MOVE") {
+                imap::uid_move_bulk(&self.config, &mut session, &uid_set, &trash).await?;
+            } else {
+                // No MOVE capability: COPY to Trash, then expunge the source uids.
+                imap::uid_copy_bulk(&self.config, &mut session, &uid_set, &trash).await?;
+                imap::uid_store_bulk(
+                    &self.config,
+                    &mut session,
+                    &uid_set,
+                    "+FLAGS.SILENT (\\Deleted)",
+                )
+                .await?;
+                imap::uid_expunge_bulk(&self.config, &mut session, &uid_set).await?;
+            }
+            trash_mailbox = Some(trash);
+        } else {
+            imap::uid_store_bulk(
+                &self.config,
+                &mut session,
+                &uid_set,
+                "+FLAGS.SILENT (\\Deleted)",
+            )
+            .await?;
+            imap::uid_expunge_bulk(&self.config, &mut session, &uid_set).await?;
+        }
 
         let deleted_count = uids_to_delete.len();
         let remaining = total_matched - deleted_count;
@@ -2550,6 +2948,11 @@ impl MailImapServer {
             "mailbox": input.mailbox,
             "total_matched": total_matched,
             "deleted_count": deleted_count,
+            "action": action.as_str(),
+            "trash_mailbox": trash_mailbox,
+            "note": trash_mailbox.as_ref().map(|_| {
+                "Matches moved to Trash (reversible). Permanent delete works only from Trash: run the delete again on the Trash copies."
+            }),
             "remaining": remaining,
             "has_more": remaining > 0,
         }))
@@ -2649,20 +3052,49 @@ impl MailImapServer {
             ));
         }
 
-        imap::uid_store_bulk(
-            &self.config,
-            &mut session,
-            &uid_set,
-            "+FLAGS.SILENT (\\Deleted)",
-        )
-        .await?;
-        imap::uid_expunge_bulk(&self.config, &mut session, &uid_set).await?;
+        let action = delete_action_for_mailbox(&parsed.mailbox);
+        let mut trash_mailbox: Option<String> = None;
+        if let DeleteAction::MoveToTrash = action {
+            // Outside Trash, expunging in place silently orphans the message
+            // on the Proton bridge — move to Trash instead (reversible).
+            let trash = resolve_trash_mailbox(&self.config, &mut session).await?;
+            let caps = imap::capabilities(&self.config, &mut session).await?;
+            if caps.has_str("MOVE") {
+                imap::uid_move_bulk(&self.config, &mut session, &uid_set, &trash).await?;
+            } else {
+                // No MOVE capability: COPY to Trash, then expunge the source uids.
+                imap::uid_copy_bulk(&self.config, &mut session, &uid_set, &trash).await?;
+                imap::uid_store_bulk(
+                    &self.config,
+                    &mut session,
+                    &uid_set,
+                    "+FLAGS.SILENT (\\Deleted)",
+                )
+                .await?;
+                imap::uid_expunge_bulk(&self.config, &mut session, &uid_set).await?;
+            }
+            trash_mailbox = Some(trash);
+        } else {
+            imap::uid_store_bulk(
+                &self.config,
+                &mut session,
+                &uid_set,
+                "+FLAGS.SILENT (\\Deleted)",
+            )
+            .await?;
+            imap::uid_expunge_bulk(&self.config, &mut session, &uid_set).await?;
+        }
 
         Ok(serde_json::json!({
             "status": "ok",
             "account_id": input.account_id,
             "mailbox": parsed.mailbox,
             "deleted_count": parsed.uids.len(),
+            "action": action.as_str(),
+            "trash_mailbox": trash_mailbox,
+            "note": trash_mailbox.as_ref().map(|_| {
+                "Messages moved to Trash (reversible). Permanent delete works only from Trash: run the delete again on the Trash copies."
+            }),
         }))
     }
 
@@ -3257,6 +3689,159 @@ fn is_sent_folder_name(name: &str) -> bool {
         || lower.ends_with("/enviados")
         || lower.ends_with("/elementos enviados")
         || lower.contains("[gmail]/sent")
+}
+
+/// Return `true` if `name` refers to a Trash / deleted-messages mailbox.
+/// Case-insensitive. The Proton bridge's Trash is literally `Trash`.
+fn is_trash_mailbox(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "trash" | "deleted" | "deleted messages" | "deleted items"
+    ) || lower.ends_with("/trash")
+        || lower.ends_with("/deleted")
+        || lower.ends_with("/deleted messages")
+        || lower.ends_with("/deleted items")
+        || lower.contains("[gmail]/trash")
+}
+
+/// Return `true` if `name` refers to a label mailbox.
+///
+/// On the Proton bridge labels live under a `\Noselect` root as
+/// `Labels/<Name>`; expunging inside one removes the label while the
+/// INBOX/All Mail copy survives.
+fn is_label_mailbox(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "labels" || lower.starts_with("labels/")
+}
+
+/// What "delete" means for a mailbox
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteAction {
+    /// Mailbox is Trash: `\Deleted` + expunge is a true permanent delete.
+    Permanent,
+    /// Label mailbox (`Labels/<Name>`): expunge removes the label; the
+    /// INBOX/All Mail copy survives.
+    RemoveLabel,
+    /// Anything else: move to Trash (reversible), never expunge in place.
+    MoveToTrash,
+}
+
+impl DeleteAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Permanent => "permanently_deleted",
+            Self::RemoveLabel => "removed_label",
+            Self::MoveToTrash => "moved_to_trash",
+        }
+    }
+}
+
+/// Classify a mailbox for delete semantics
+fn delete_action_for_mailbox(mailbox: &str) -> DeleteAction {
+    if is_trash_mailbox(mailbox) {
+        DeleteAction::Permanent
+    } else if is_label_mailbox(mailbox) {
+        DeleteAction::RemoveLabel
+    } else {
+        DeleteAction::MoveToTrash
+    }
+}
+
+/// Resolve the Trash mailbox name for an account
+///
+/// Heuristic match over LIST (same approach as Sent-folder detection);
+/// falls back to literal `Trash` (the Proton bridge name).
+async fn resolve_trash_mailbox(
+    config: &ServerConfig,
+    session: &mut imap::ImapSession,
+) -> AppResult<String> {
+    let mailboxes = imap::list_all_mailboxes(config, session).await?;
+    Ok(mailboxes
+        .iter()
+        .map(|m| m.name().to_owned())
+        .find(|name| is_trash_mailbox(name))
+        .unwrap_or_else(|| "Trash".to_owned()))
+}
+
+/// Resolve an attachment's metadata and bytes for `imap_get_attachment`
+///
+/// Prefers part-level `BODY.PEEK[<part>]` fetches (no `\Seen` side effect,
+/// section ids match `mime::walk_parts` numbering); falls back to a full
+/// `BODY.PEEK[]` fetch + MIME walk when the server does not return the
+/// section directly. The full-message fallback is still PEEK-based, so the
+/// message is never marked as read.
+async fn resolve_attachment_bytes(
+    config: &ServerConfig,
+    session: &mut imap::ImapSession,
+    uid: u32,
+    part_id: Option<&str>,
+    filename: Option<&str>,
+) -> AppResult<(crate::models::AttachmentInfo, Vec<u8>)> {
+    if let Some(part_id) = part_id.filter(|_| filename.is_none())
+        && let Ok(Some(bytes)) = imap::fetch_part_peek(config, session, uid, part_id).await
+    {
+        let (content_type, filename) =
+            match imap::fetch_part_mime_peek(config, session, uid, part_id).await {
+                Ok(Some(mime_headers)) => part_metadata_from_mime_headers(&mime_headers),
+                _ => ("application/octet-stream".to_owned(), None),
+            };
+        return Ok((
+            crate::models::AttachmentInfo {
+                filename,
+                content_type,
+                size_bytes: bytes.len(),
+                part_id: part_id.to_owned(),
+                extracted_text: None,
+            },
+            bytes,
+        ));
+    }
+    // Section fetch unavailable — resolve against the full message below.
+
+    let raw = imap::fetch_message_peek(config, session, uid).await?;
+    let resolved = mime::resolve_attachment(&raw, part_id, filename)?;
+    Ok((resolved.info, resolved.bytes))
+}
+
+/// Extract (content type, filename) from a part's MIME header block
+///
+/// The block is the RFC822 header section returned by `BODY.PEEK[<part>.MIME]`.
+fn part_metadata_from_mime_headers(mime_headers: &[u8]) -> (String, Option<String>) {
+    let (headers, _) = match mailparse::parse_headers(mime_headers) {
+        Ok(parsed) => parsed,
+        Err(_) => return ("application/octet-stream".to_owned(), None),
+    };
+
+    let header_value = |name: &str| {
+        headers
+            .iter()
+            .find(|h| h.get_key().eq_ignore_ascii_case(name))
+            .map(|h| h.get_value())
+    };
+
+    let content_type = header_value("content-type")
+        .map(|value| {
+            mailparse::parse_content_type(&value)
+                .mimetype
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_else(|| "application/octet-stream".to_owned());
+
+    let ct_filename = header_value("content-type").and_then(|value| {
+        mailparse::parse_content_type(&value)
+            .params
+            .get("name")
+            .cloned()
+    });
+    let disp_filename = header_value("content-disposition").and_then(|value| {
+        mailparse::parse_content_disposition(&value)
+            .params
+            .get("filename")
+            .cloned()
+    });
+
+    (content_type, disp_filename.or(ct_filename))
 }
 
 /// Calculate elapsed milliseconds
@@ -4166,9 +4751,76 @@ fn parse_bulk_message_ids(account_id: &str, message_ids: &[String]) -> AppResult
 /// Tests for server-side validation and encoding helpers.
 mod tests {
     use super::{
-        encode_raw_source_base64, escape_imap_quoted, is_sent_folder_name, validate_flag,
-        validate_mailbox, validate_search_text,
+        DeleteAction, delete_action_for_mailbox, encode_raw_source_base64, escape_imap_quoted,
+        is_label_mailbox, is_sent_folder_name, is_trash_mailbox, part_metadata_from_mime_headers,
+        validate_flag, validate_mailbox, validate_search_text,
     };
+
+    #[test]
+    fn trash_detection_covers_common_providers() {
+        // Proton bridge: literal top-level Trash
+        assert!(is_trash_mailbox("Trash"));
+        assert!(is_trash_mailbox("trash"));
+        // Nested and Gmail
+        assert!(is_trash_mailbox("INBOX/Trash"));
+        assert!(is_trash_mailbox("[Gmail]/Trash"));
+        // Common provider variants
+        assert!(is_trash_mailbox("Deleted Items"));
+        assert!(is_trash_mailbox("Deleted Messages"));
+        assert!(is_trash_mailbox("INBOX/Deleted"));
+    }
+
+    #[test]
+    fn trash_detection_rejects_unrelated_names() {
+        assert!(!is_trash_mailbox("INBOX"));
+        assert!(!is_trash_mailbox("Spam"));
+        assert!(!is_trash_mailbox("All Mail"));
+        assert!(!is_trash_mailbox("Labels/Work"));
+        assert!(!is_trash_mailbox("Trashed"));
+        assert!(!is_trash_mailbox(""));
+    }
+
+    #[test]
+    fn label_detection_matches_proton_hierarchy() {
+        assert!(is_label_mailbox("Labels/Work"));
+        assert!(is_label_mailbox("labels/personal"));
+        assert!(is_label_mailbox("Labels"));
+        assert!(!is_label_mailbox("INBOX"));
+        assert!(!is_label_mailbox("Folders/Projects"));
+        assert!(!is_label_mailbox("LabelsX"));
+    }
+
+    #[test]
+    fn delete_action_classification() {
+        assert_eq!(delete_action_for_mailbox("Trash"), DeleteAction::Permanent);
+        assert_eq!(
+            delete_action_for_mailbox("Labels/Work"),
+            DeleteAction::RemoveLabel
+        );
+        assert_eq!(
+            delete_action_for_mailbox("INBOX"),
+            DeleteAction::MoveToTrash
+        );
+        assert_eq!(delete_action_for_mailbox("Spam"), DeleteAction::MoveToTrash);
+        assert_eq!(
+            delete_action_for_mailbox("All Mail"),
+            DeleteAction::MoveToTrash
+        );
+    }
+
+    #[test]
+    fn mime_header_block_yields_content_type_and_filename() {
+        let headers = b"Content-Type: application/pdf; name=\"report.pdf\"\r\n\
+             Content-Disposition: attachment; filename=\"report.pdf\"\r\n";
+        let (content_type, filename) = part_metadata_from_mime_headers(headers);
+        assert_eq!(content_type, "application/pdf");
+        assert_eq!(filename.as_deref(), Some("report.pdf"));
+
+        let (content_type, filename) =
+            part_metadata_from_mime_headers(b"Content-Type: image/jpeg\r\n");
+        assert_eq!(content_type, "image/jpeg");
+        assert_eq!(filename, None);
+    }
 
     #[test]
     fn sent_folder_detection_covers_common_providers() {

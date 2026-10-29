@@ -94,6 +94,10 @@ pub struct ServerConfig {
     pub cursor_ttl_seconds: u64,
     /// Maximum number of cursors to retain (LRU eviction when exceeded)
     pub cursor_max_entries: usize,
+    /// Maximum attachment size returned inline (base64) by `imap_get_attachment`
+    ///
+    /// Larger attachments must be fetched with `save_to` instead.
+    pub attachment_max_inline_bytes: usize,
 }
 
 impl ServerConfig {
@@ -174,6 +178,10 @@ impl ServerConfig {
             socket_timeout_ms: parse_u64_env("MAIL_IMAP_SOCKET_TIMEOUT_MS", 300_000)?,
             cursor_ttl_seconds: parse_u64_env("MAIL_IMAP_CURSOR_TTL_SECONDS", 600)?,
             cursor_max_entries: parse_usize_env("MAIL_IMAP_CURSOR_MAX_ENTRIES", 512)?,
+            attachment_max_inline_bytes: parse_usize_env(
+                "MAIL_ATTACHMENT_MAX_INLINE_BYTES",
+                256 * 1024,
+            )?,
         })
     }
 

@@ -11,6 +11,7 @@ use std::time::Duration;
 use async_imap::types::{Fetch, Flag};
 use async_imap::{Client, Session};
 use futures::TryStreamExt;
+use imap_proto::types::{MessageSection, SectionPath};
 use rustls::ClientConfig;
 use rustls::RootCertStore;
 use rustls_pki_types::ServerName;
@@ -339,7 +340,9 @@ pub async fn fetch_one(
 
 /// Fetch full RFC822 message source
 ///
-/// Returns raw bytes of the entire message.
+/// Returns raw bytes of the entire message. Note: this uses a plain `RFC822`
+/// fetch, which marks the message as `\Seen`. Use [`fetch_message_peek`] when
+/// the read must not have that side effect.
 pub async fn fetch_raw_message(
     server: &ServerConfig,
     session: &mut ImapSession,
@@ -350,6 +353,79 @@ pub async fn fetch_raw_message(
         .body()
         .ok_or_else(|| AppError::Internal("message has no RFC822 body".to_owned()))?;
     Ok(body.to_vec())
+}
+
+/// Fetch full RFC822 message source without marking it as seen
+///
+/// Uses `BODY.PEEK[]` so the `\Seen` flag is never set.
+pub async fn fetch_message_peek(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid: u32,
+) -> AppResult<Vec<u8>> {
+    let fetch = fetch_one(server, session, uid, "BODY.PEEK[]").await?;
+    fetch
+        .body()
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| AppError::Internal("BODY.PEEK[] returned no body".to_owned()))
+}
+
+/// Fetch a MIME part's bytes without marking the message as seen
+///
+/// Uses `BODY.PEEK[<part>]` where `<part>` is a dotted IMAP section number
+/// (e.g. `1.2`) as assigned by `mime::walk_parts`. Returns `None` when the
+/// server responded without the section body (e.g. unknown part id) so the
+/// caller can fall back to a full [`fetch_message_peek`] + MIME walk.
+pub async fn fetch_part_peek(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid: u32,
+    part_id: &str,
+) -> AppResult<Option<Vec<u8>>> {
+    let digits = parse_section_digits(part_id)?;
+    let fetch = fetch_one(server, session, uid, &format!("BODY.PEEK[{part_id}]")).await?;
+    Ok(fetch
+        .section(&SectionPath::Part(digits, None))
+        .map(<[u8]>::to_vec))
+}
+
+/// Fetch a MIME part's MIME header block without marking the message as seen
+///
+/// Uses `BODY.PEEK[<part>.MIME]` so the `\Seen` flag is never set. Returns
+/// `None` when the server responded without the section body.
+pub async fn fetch_part_mime_peek(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid: u32,
+    part_id: &str,
+) -> AppResult<Option<Vec<u8>>> {
+    let digits = parse_section_digits(part_id)?;
+    let fetch = fetch_one(server, session, uid, &format!("BODY.PEEK[{part_id}.MIME]")).await?;
+    Ok(fetch
+        .section(&SectionPath::Part(digits, Some(MessageSection::Mime)))
+        .map(<[u8]>::to_vec))
+}
+
+/// Parse a dotted numeric IMAP section id (`"1"`, `"1.2.3"`) into its parts
+///
+/// Doubles as validation: the id is only ever used inside a `BODY.PEEK[...]`
+/// query, so only digits and dots are accepted.
+pub fn parse_section_digits(part_id: &str) -> AppResult<Vec<u32>> {
+    if part_id.is_empty() || part_id.len() > 64 {
+        return Err(AppError::InvalidInput(
+            "part_id must be 1..64 characters".to_owned(),
+        ));
+    }
+    part_id
+        .split('.')
+        .map(|segment| {
+            segment.parse::<u32>().map_err(|_| {
+                AppError::InvalidInput(format!(
+                    "part_id must be digits separated by dots, got '{part_id}'"
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Fetch curated headers and flags
@@ -686,9 +762,9 @@ mod tests {
     use tokio_rustls::TlsConnector;
 
     use super::{
-        append, fetch_flags, fetch_raw_message, list_all_mailboxes, noop, select_mailbox_readonly,
-        select_mailbox_readwrite, socket_timeout, uid_copy, uid_expunge, uid_move, uid_search,
-        uid_store,
+        append, fetch_flags, fetch_raw_message, list_all_mailboxes, noop, parse_section_digits,
+        select_mailbox_readonly, select_mailbox_readwrite, socket_timeout, uid_copy, uid_expunge,
+        uid_move, uid_search, uid_store,
     };
     use crate::config::{AccountConfig, ServerConfig};
 
@@ -753,6 +829,7 @@ mod tests {
             socket_timeout_ms: 15_000,
             cursor_ttl_seconds: 600,
             cursor_max_entries: 128,
+            attachment_max_inline_bytes: 256 * 1024,
         }
     }
 
@@ -909,6 +986,21 @@ mod tests {
                 last_login_err.as_str()
             }
         ))
+    }
+
+    /// Tests that dotted section ids parse into digit paths and invalid ids
+    /// are rejected (the id is spliced into a FETCH query, so only digits and
+    /// dots are allowed).
+    #[test]
+    fn parse_section_digits_validates_section_ids() {
+        assert_eq!(parse_section_digits("1").expect("valid"), vec![1]);
+        assert_eq!(parse_section_digits("1.2.3").expect("valid"), vec![1, 2, 3]);
+        assert!(parse_section_digits("").is_err());
+        assert!(parse_section_digits("1.").is_err());
+        assert!(parse_section_digits("1..2").is_err());
+        assert!(parse_section_digits("a.b").is_err());
+        assert!(parse_section_digits("1.2.MIME").is_err());
+        assert!(parse_section_digits("1;2").is_err());
     }
 
     /// Creates a mailbox if it does not already exist.

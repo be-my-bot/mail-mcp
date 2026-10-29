@@ -262,6 +262,28 @@ pub struct GetMessageRawInput {
     pub max_bytes: usize,
 }
 
+/// Input: get a message attachment
+///
+/// Used by `imap_get_attachment`. Select the part by `part_id` or `filename`
+/// (if both are given, the filename is resolved against the attachment list
+/// and must agree with `part_id`). With `save_to`, bytes are written to an
+/// absolute path; otherwise they are returned as base64 when under the
+/// inline size cap (`MAIL_ATTACHMENT_MAX_INLINE_BYTES`, default 256 KB).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GetAttachmentInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Stable message identifier (format: `imap:{account}:{mailbox}:{uidvalidity}:{uid}`)
+    pub message_id: String,
+    /// MIME part id of the attachment (from `imap_get_message`, e.g. `1.2`)
+    pub part_id: Option<String>,
+    /// Filename to select (from the attachment list); ambiguous matches are rejected
+    pub filename: Option<String>,
+    /// Absolute path to write the attachment to (skips the base64 response)
+    pub save_to: Option<String>,
+}
+
 /// Input: update message flags
 ///
 /// Used by `imap_update_message_flags`. Requires at least one flag operation.

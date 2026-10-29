@@ -66,7 +66,7 @@ pub fn parse_message(
     let headers = parse_all_headers(raw)?;
     let mut body_text = None;
     let mut body_html = None;
-    let mut attachments = Vec::new();
+    let mut attachments: Vec<(AttachmentInfo, Vec<u8>)> = Vec::new();
 
     walk_parts(
         &parsed,
@@ -95,7 +95,7 @@ pub fn parse_message(
         headers_all: headers,
         body_text: text,
         body_html_sanitized: html,
-        attachments,
+        attachments: attachments.into_iter().map(|(info, _)| info).collect(),
     })
 }
 
@@ -108,7 +108,7 @@ fn walk_parts(
     part_id: String,
     body_text: &mut Option<String>,
     body_html: &mut Option<String>,
-    attachments: &mut Vec<AttachmentInfo>,
+    attachments: &mut Vec<(AttachmentInfo, Vec<u8>)>,
     extract_attachment_text: bool,
     attachment_text_max_chars: usize,
 ) -> AppResult<()> {
@@ -147,13 +147,16 @@ fn walk_parts(
                 extracted_text = Some(truncate_chars(text, attachment_text_max_chars));
             }
 
-            attachments.push(AttachmentInfo {
-                filename,
-                content_type: ctype,
-                size_bytes: raw_body.len(),
-                part_id,
-                extracted_text,
-            });
+            attachments.push((
+                AttachmentInfo {
+                    filename,
+                    content_type: ctype,
+                    size_bytes: raw_body.len(),
+                    part_id,
+                    extracted_text,
+                },
+                raw_body,
+            ));
         }
 
         return Ok(());
@@ -172,6 +175,155 @@ fn walk_parts(
         )?;
     }
     Ok(())
+}
+
+/// A resolved attachment: metadata plus decoded part bytes
+#[derive(Debug)]
+pub struct ResolvedAttachment {
+    /// Attachment metadata (part id, content type, filename, size)
+    pub info: AttachmentInfo,
+    /// Decoded part bytes
+    pub bytes: Vec<u8>,
+}
+
+/// Resolve an attachment by `part_id` or `filename`
+///
+/// - `part_id` only: exact match on the synthetic MIME path (IMAP section
+///   numbering, e.g. `1.2`). Any leaf part can be addressed, including
+///   inline text parts.
+/// - `filename` (with or without `part_id`): matched against the attachment
+///   list — exact first, then case-insensitive. Zero matches is a `NotFound`
+///   error, more than one is an `InvalidInput` ambiguity error, and a
+///   `part_id` that disagrees with the match is rejected.
+///
+/// # Errors
+///
+/// - `Internal` if `mailparse` fails
+/// - `NotFound` if nothing matches
+/// - `InvalidInput` on ambiguous or contradictory selection
+pub fn resolve_attachment(
+    raw: &[u8],
+    part_id: Option<&str>,
+    filename: Option<&str>,
+) -> AppResult<ResolvedAttachment> {
+    let parsed = mailparse::parse_mail(raw)
+        .map_err(|e| AppError::Internal(format!("failed to parse RFC822 message: {e}")))?;
+
+    let mut leaves = Vec::new();
+    collect_leaf_parts(&parsed, "1".to_owned(), &mut leaves);
+
+    if let Some(filename) = filename {
+        let mut matches: Vec<&LeafPart> = leaves
+            .iter()
+            .filter(|leaf| leaf.is_attachment && leaf.filename.as_deref() == Some(filename))
+            .collect();
+        if matches.is_empty() {
+            matches = leaves
+                .iter()
+                .filter(|leaf| {
+                    leaf.is_attachment
+                        && leaf
+                            .filename
+                            .as_deref()
+                            .is_some_and(|f| f.eq_ignore_ascii_case(filename))
+                })
+                .collect();
+        }
+        match matches.len() {
+            0 => Err(AppError::NotFound(format!(
+                "no attachment named '{filename}'"
+            ))),
+            1 => {
+                let leaf = matches[0];
+                if let Some(part_id) = part_id
+                    && part_id != leaf.part_id
+                {
+                    return Err(AppError::InvalidInput(format!(
+                        "part_id '{part_id}' does not match attachment '{filename}' (part {})",
+                        leaf.part_id
+                    )));
+                }
+                Ok(ResolvedAttachment {
+                    info: leaf.to_attachment_info(),
+                    bytes: leaf.bytes.clone(),
+                })
+            }
+            n => Err(AppError::InvalidInput(format!(
+                "filename '{filename}' matches {n} attachments (parts {}); select by part_id instead",
+                matches
+                    .iter()
+                    .map(|m| m.part_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    } else if let Some(part_id) = part_id {
+        let leaf = leaves
+            .iter()
+            .find(|leaf| leaf.part_id == part_id)
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "no message part '{part_id}' (available parts: {})",
+                    leaves
+                        .iter()
+                        .map(|l| l.part_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?;
+        Ok(ResolvedAttachment {
+            info: leaf.to_attachment_info(),
+            bytes: leaf.bytes.clone(),
+        })
+    } else {
+        Err(AppError::InvalidInput(
+            "provide part_id or filename".to_owned(),
+        ))
+    }
+}
+
+/// A leaf MIME part with its section id and decoded bytes
+struct LeafPart {
+    part_id: String,
+    content_type: String,
+    filename: Option<String>,
+    is_attachment: bool,
+    bytes: Vec<u8>,
+}
+
+impl LeafPart {
+    fn to_attachment_info(&self) -> AttachmentInfo {
+        AttachmentInfo {
+            filename: self.filename.clone(),
+            content_type: self.content_type.clone(),
+            size_bytes: self.bytes.len(),
+            part_id: self.part_id.clone(),
+            extracted_text: None,
+        }
+    }
+}
+
+/// Collect every leaf MIME part with its synthetic section id
+fn collect_leaf_parts(part: &ParsedMail<'_>, part_id: String, out: &mut Vec<LeafPart>) {
+    if part.subparts.is_empty() {
+        let ctype = part.ctype.mimetype.to_ascii_lowercase();
+        let disp = part.get_content_disposition();
+        let filename = attachment_filename(part, &disp.params);
+        let is_attachment = disp.disposition == DispositionType::Attachment || filename.is_some();
+        let bytes = part.get_body_raw().unwrap_or_default();
+        out.push(LeafPart {
+            part_id,
+            content_type: ctype,
+            filename,
+            is_attachment,
+            bytes,
+        });
+        return;
+    }
+
+    for (idx, sub) in part.subparts.iter().enumerate() {
+        collect_leaf_parts(sub, format!("{part_id}.{}", idx + 1), out);
+    }
 }
 
 /// Extract attachment filename from part
@@ -315,5 +467,126 @@ mod tests {
         assert_eq!(parsed.to.as_deref(), Some("user@example.com"));
         assert_eq!(parsed.body_text.as_deref(), Some("Hello there"));
         assert!(parsed.attachments.is_empty());
+    }
+
+    /// Build a nested multipart message: multipart/mixed wrapping a
+    /// multipart/alternative (plain + html) and a PDF attachment.
+    fn nested_multipart_raw() -> Vec<u8> {
+        let boundary_inner = "alt-boundary";
+        let boundary_outer = "mix-boundary";
+        format!(
+            "From: sender@example.com\r\n\
+             To: user@example.com\r\n\
+             Subject: Multipart\r\n\
+             Date: Wed, 1 Jan 2025 00:00:00 +0000\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"{boundary_outer}\"\r\n\
+             \r\n\
+             --{boundary_outer}\r\n\
+             Content-Type: multipart/alternative; boundary=\"{boundary_inner}\"\r\n\
+             \r\n\
+             --{boundary_inner}\r\n\
+             Content-Type: text/plain\r\n\
+             \r\n\
+             plain body\r\n\
+             --{boundary_inner}\r\n\
+             Content-Type: text/html\r\n\
+             \r\n\
+             <p>html body</p>\r\n\
+             --{boundary_inner}--\r\n\
+             --{boundary_outer}\r\n\
+             Content-Type: application/pdf\r\n\
+             Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
+             \r\n\
+             %PDF-1.4 fake bytes\r\n\
+             --{boundary_outer}--\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// Tests that `walk_parts` part ids line up with IMAP section numbering:
+    /// children of the root get `1.1`, `1.2`, ... so `BODY.PEEK[<part_id>]`
+    /// fetches the same part.
+    #[test]
+    fn part_ids_follow_imap_section_numbering() {
+        let parsed = parse_message(&nested_multipart_raw(), 2000, false, false, 0)
+            .expect("parse should succeed");
+
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].part_id, "1.2");
+        assert_eq!(
+            parsed.attachments[0].filename.as_deref(),
+            Some("report.pdf")
+        );
+    }
+
+    /// Tests resolving an attachment by part id, including inline (non-attachment)
+    /// leaf parts.
+    #[test]
+    fn resolves_attachment_by_part_id() {
+        let raw = nested_multipart_raw();
+
+        let resolved =
+            super::resolve_attachment(&raw, Some("1.2"), None).expect("part 1.2 should resolve");
+        assert_eq!(resolved.info.part_id, "1.2");
+        assert_eq!(resolved.info.content_type, "application/pdf");
+        assert_eq!(resolved.info.size_bytes, resolved.bytes.len());
+        assert!(resolved.bytes.starts_with(b"%PDF-1.4"));
+
+        // Inline text parts are addressable by part id too.
+        let text = super::resolve_attachment(&raw, Some("1.1.1"), None)
+            .expect("part 1.1.1 should resolve");
+        assert_eq!(text.info.content_type, "text/plain");
+        assert_eq!(text.bytes, b"plain body");
+    }
+
+    /// Tests filename resolution: exact, case-insensitive fallback, ambiguity,
+    /// not-found, and part_id/filename contradiction.
+    #[test]
+    fn resolves_attachment_by_filename() {
+        let raw = nested_multipart_raw();
+
+        let resolved =
+            super::resolve_attachment(&raw, None, Some("report.pdf")).expect("should resolve");
+        assert_eq!(resolved.info.part_id, "1.2");
+
+        let resolved = super::resolve_attachment(&raw, Some("1.2"), Some("REPORT.PDF"))
+            .expect("case-insensitive match should resolve");
+        assert_eq!(resolved.info.part_id, "1.2");
+
+        let err = super::resolve_attachment(&raw, None, Some("missing.pdf"))
+            .expect_err("missing filename must fail");
+        assert!(err.to_string().contains("no attachment named"));
+
+        let err = super::resolve_attachment(&raw, Some("1.1.1"), Some("report.pdf"))
+            .expect_err("contradicting part_id must fail");
+        assert!(err.to_string().contains("does not match"));
+    }
+
+    /// Tests that an ambiguous filename is rejected instead of guessing.
+    #[test]
+    fn rejects_ambiguous_filename() {
+        let raw = b"From: sender@example.com\r\n\
+             To: user@example.com\r\n\
+             Subject: Dup\r\n\
+             Date: Wed, 1 Jan 2025 00:00:00 +0000\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"b\"\r\n\
+             \r\n\
+             --b\r\n\
+             Content-Type: application/octet-stream\r\n\
+             Content-Disposition: attachment; filename=\"data.bin\"\r\n\
+             \r\n\
+             AAAA\r\n\
+             --b\r\n\
+             Content-Type: application/octet-stream\r\n\
+             Content-Disposition: attachment; filename=\"data.bin\"\r\n\
+             \r\n\
+             BBBB\r\n\
+             --b--\r\n";
+
+        let err =
+            super::resolve_attachment(raw, None, Some("data.bin")).expect_err("must be ambiguous");
+        assert!(err.to_string().contains("matches 2 attachments"));
     }
 }
