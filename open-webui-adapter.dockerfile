@@ -11,7 +11,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/mail-mcp /usr/local/bin/mail-mcp
 COPY scripts/run-open-webui-adapter.sh /usr/local/bin/run-open-webui-adapter.sh
 RUN chmod +x /usr/local/bin/run-open-webui-adapter.sh \
-    && pip install --no-cache-dir mcpo
+    && pip install --no-cache-dir mcpo "mcp>=1,<2"
 ENV MAIL_MCP_BIN=/usr/local/bin/mail-mcp \
     MCPO_HOST=0.0.0.0 \
     MCPO_PORT=8000 \
