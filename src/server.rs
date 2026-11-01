@@ -4254,8 +4254,6 @@ fn part_metadata_from_mime_headers(mime_headers: &[u8]) -> (String, Option<Strin
     });
 
     (content_type, disp_filename.or(ct_filename))
-        }
-    }
 }
 
 fn is_draft_folder_name(name: &str) -> bool {
